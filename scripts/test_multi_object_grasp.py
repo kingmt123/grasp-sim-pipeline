@@ -46,7 +46,13 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 
 # ── Panda 末端执行器配置 ─────────────────────────────────────────────
 END_EFFECTOR_INDEX = 8   # panda_hand
-FINGER_OFFSET = 0.105     # hand 关节原点到指尖
+# FINGER_OFFSET = IK 控制的 hand link 坐标系原点(link frame) → 真实指尖(手指碰撞 AABB 最低点)
+# 实测（scripts/diagnose_finger_geometry.py, 2026-09-10, 目标 0.750/0.800/0.900 三档一致）:
+#   link frame → 手指 AABB 最低点   = 0.1162 m   ← 取此值
+#   link frame → panda_grasptarget  = 0.1050 m
+#   link frame = IK 目标（残差 ≤0.1cm）；旧代码读的 [0] 是 CoM，比 link frame 低 3.90cm，
+#   历史上被误读成"IK 工作空间极限 3.9cm 残差"，并据此塞了 ik_bias 补偿。
+FINGER_OFFSET = 0.1162
 
 # 融合视角（变高度，指向目标物体）
 FUSION_VIEWS_CONFIG = [
@@ -58,8 +64,10 @@ FUSION_VIEWS_CONFIG = [
 # ── 辅助函数 ─────────────────────────────────────────────────────────
 
 def get_ee_pos(robot_id):
+    # 必须用 link frame（世界坐标，索引 4），而不是 [0]（CoM）：
+    # IK 的控制目标是 link frame，读 CoM 会凭空多出 3.90cm 的"残差"。
     state = p.getLinkState(robot_id, END_EFFECTOR_INDEX)
-    return list(state[0])
+    return list(state[4])
 
 
 def control_gripper(robot_id, open_width, steps=200, force=350):
@@ -91,7 +99,7 @@ def estimate_object_pose(obj_name, target_class_id, _obj_pos_rough, yolo_detecto
     Stage 2: 多视角指向 Stage1 XY → YOLO mask → 点云
              → 逐视角3D质心 → 加权中位数融合
     """
-    FIXED_CY = -54
+    FIXED_CY = 0   # 内参修正后真主点即 240，不再需要凑合偏移（旧值 -54 是 f 偏大 4/3 的补偿）
     estimator = PoseEstimator(cy_offset=FIXED_CY)
 
     def _mask_to_pts(rgb_bgr, depth, view_matrix):
@@ -287,27 +295,19 @@ def _detect_waist_height(pts, grasp_yaw, table_z, finger_offset, obj_name=None, 
     if z_range < 0.02:
         return table_z + 0.005
 
-    # ── 物体形状自适应比例 ─────────────────────────────────────
-    # teddy: 25% — 夹身体偏下，避尾巴尖
-    # duck:  20% — 略高于底部，夹腹部
-    # cube:  15% — 矮小对称，底部稳定
-    WAIST_RATIOS = {
-        "teddy": 0.25,
-        "duck":  0.20,
-        "cube":  0.15,
-    }
-    waist_ratio = WAIST_RATIOS.get(obj_name)
-    if waist_ratio is None:
-        # fallback: z_range 自适应
-        if z_range > 0.08:
-            waist_ratio = 0.30
-        elif z_range < 0.04:
-            waist_ratio = 0.15
-        else:
-            waist_ratio = 0.15 + 0.15 * (z_range - 0.04) / 0.04
-
-    grasp_z = table_z + waist_ratio * z_range
-    return grasp_z  # 手指目标 Z，不含 finger_offset
+    # ── 抓取高度：按"夹持面覆盖物体"的物理规则推导（不再per-object凑参数）──────
+    # 手指夹持面高度实测 0.062 m（diagnose_finger_geometry.py: finger AABB 0.0617-0.0620）。
+    # 目标：让夹持面尽可能完整覆盖物体高度，同时指尖不碰桌面。
+    #   - 物体比夹持面矮（cube 5cm）→ 指尖贴桌（桌面+5mm），夹持面覆盖整个物体
+    #   - 物体比夹持面高（duck/teddy 8~9cm）→ 夹持面在物体上居中覆盖
+    PAD_LEN = 0.062
+    MIN_CLEARANCE = 0.005
+    height = max(z_max - table_z, 0.005)
+    if height <= PAD_LEN:
+        grasp_z = table_z + MIN_CLEARANCE
+    else:
+        grasp_z = table_z + (height - PAD_LEN) / 2.0
+    return max(grasp_z, table_z + MIN_CLEARANCE)  # 手指目标 Z，不含 finger_offset
 
 def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
     """
@@ -334,10 +334,12 @@ def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
     #   duck: 负 bias → 目标偏低 → IK 残差~3.9cm → 指尖靠近桌面
     #   teddy: 零 bias → 目标偏高 → IK 残差~3.9cm → 指尖在物体中部 (更合理的夹取方式)
     #   cube: 负 bias → VHACD 侧面接触 (小物体)
+    # ik_bias: 只保留 mm 级微调。cm 级残差由 grasp_object 的闭环修正处理（实测重发目标），
+    #   不再用 per-object 常数去抵消 —— 那会把"命令位置"和"实际抓取位置"解耦。
     obj_params = {
-        "duck":  {"force": 500, "fine_steps": 600, "threshold": 2e-3, "appr_gap": 0.05, "ik_bias": -0.020},
+        "duck":  {"force": 500, "fine_steps": 600, "threshold": 2e-3, "appr_gap": 0.05, "ik_bias": 0.000},
         "teddy": {"force": 800, "fine_steps": 600, "threshold": 2e-3, "appr_gap": 0.05, "ik_bias": 0.000},
-        "cube":  {"force": 1000, "fine_steps": 800, "threshold": 1e-3, "appr_gap": 0.03, "ik_bias": -0.020},
+        "cube":  {"force": 1000, "fine_steps": 800, "threshold": 1e-3, "appr_gap": 0.03, "ik_bias": 0.000},
     }
     pset = obj_params.get(obj_name, obj_params["duck"])
 
@@ -384,6 +386,23 @@ def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
     ee = get_ee_pos(robot_id)
     err = math.dist([ox, oy, fine_z], ee)
     print(f"      ✓ fine     | err={err*100:.1f}cm  hand_Z={ee[2]:.3f}  fingertip_Z={ee[2]-FINGER_OFFSET:.3f}")
+
+    # ── 闭环微调：把"残差补偿常数"改成"实测修正" ────────────────────
+    # 位置控制在工作空间边缘会稳定停在目标下方 1~4cm（对象/位姿相关），
+    # 旧做法是给每个物体塞一个 ik_bias 常数把它抵消 —— 那属于补偿量。
+    # 这里改为实测残差后重发一次目标（最多 2 轮），ik_bias 只保留 mm 级微调。
+    for corr in range(2):
+        dz = fine_z - ee[2]
+        if abs(dz) < 0.003:
+            break
+        print(f"      ↻ IK 残差修正 {corr+1}/2: 实测 hand_Z={ee[2]:.3f} 差 {dz*100:+.1f}cm → 重发目标 {fine_z+dz:.3f}")
+        move_to_pose(robot_id, [ox, oy, fine_z + dz], target_quat=down_quat,
+                     end_effector_link_index=END_EFFECTOR_INDEX,
+                     steps=400, convergence_threshold=pset["threshold"])
+        ee = get_ee_pos(robot_id)
+    err_z = (fine_z - ee[2]) * 100
+    print(f"      ✓ 修正后   | hand_Z={ee[2]:.3f} (目标 {fine_z:.3f}, Z残差={err_z:+.1f}cm) "
+          f"fingertip_Z={ee[2]-FINGER_OFFSET:.3f}")
 
     wait(steps=60)
 

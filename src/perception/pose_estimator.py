@@ -17,8 +17,11 @@ from src.configs.config import (
 
 def get_camera_intrinsics(width: int, height: int, fov_deg: float) -> np.ndarray:
     fov_rad = np.deg2rad(fov_deg)
-    f_x = (width / 2.0) / np.tan(fov_rad / 2.0)
-    f_y = f_x
+    # PyBullet computeProjectionMatrixFOV 的 fov 是【垂直】FOV，水平方向由 aspect 承担
+    # (m00 = m11 / aspect)，故两个方向的像素焦距都等于 (height/2)/tan(fov/2)。
+    # 旧实现用 (width/2) → 焦距偏大 4/3 倍，是 Z 长期偏高与 cy_offset 凑合量的根源。
+    f_y = (height / 2.0) / np.tan(fov_rad / 2.0)
+    f_x = f_y
     c_x = width / 2.0
     c_y = height / 2.0
     return np.array([[f_x, 0, c_x], [0, f_y, c_y], [0, 0, 1]])
@@ -53,7 +56,8 @@ def _pixels_to_world_points(
     if n == 0:
         return None
     x_cam = (xs - cx) * zs / fx
-    y_cam = (ys - cy) * zs / fy
+    # 图像行号 v 向下增长，而相机 +y 向上 → 取负号，否则竖直方向被镜像（Z 系统性偏移）
+    y_cam = -(ys - cy) * zs / fy
     z_cam = -zs
     V = np.array(view_matrix, dtype=np.float64).reshape(4, 4).T
     V_inv = np.linalg.inv(V)
@@ -78,11 +82,14 @@ class PoseEstimator:
     支持单视角 (estimate) 和多视角融合 (estimate_multiview)。
     """
 
-    def __init__(self, cy_offset: int = -25, verbose: bool = True):
+    def __init__(self, cy_offset: int = 0, verbose: bool = True):
         fov_rad = np.deg2rad(CAM_FOV_DEG)
-        self.fx = (CAM_WIDTH / 2.0) / np.tan(fov_rad / 2.0)
-        self.fy = self.fx
+        # 垂直 FOV → 像素焦距 (CAM_HEIGHT/2)/tan(fov/2)；水平方向由 aspect 吸收
+        self.fy = (CAM_HEIGHT / 2.0) / np.tan(fov_rad / 2.0)
+        self.fx = self.fy
         self.cx = CAM_WIDTH / 2.0
+        # 真实主点 cy = 240（由 PyBullet 投影矩阵解析确认）。
+        # cy_offset 仅作调试旋钮保留，正确值为 0。
         self.cy = CAM_HEIGHT / 2.0 + cy_offset
         self.cy_offset = cy_offset
 

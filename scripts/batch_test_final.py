@@ -107,6 +107,11 @@ def phase_pose(trials, objects, jitter, rng, detector):
             if name not in objects:
                 continue
             gt = list(p.getBasePositionAndOrientation(info["obj_id"])[0])
+            # 评分基准：点云質心是"可见表面"的质心，应与物体实际几何范围比，
+            # 而不是与 URDF 基座原点比（两者在 Z 上天然差半个物体高度）。
+            aabb = p.getAABB(info["obj_id"])
+            gt_xy = np.array([(aabb[0][0] + aabb[1][0]) / 2, (aabb[0][1] + aabb[1][1]) / 2])
+            gt_z_mid = (aabb[0][2] + aabb[1][2]) / 2
             est, _ = MAIN.estimate_object_pose(
                 name, MAIN.YOLO_CLASS_IDS[name], CAM_TARGET_ROUGH, detector
             )
@@ -114,18 +119,23 @@ def phase_pose(trials, objects, jitter, rng, detector):
                 print(f"   [{name}] ❌ 估计失败")
                 rows.append({"trial": t, "object": name, "ok": False})
                 continue
-            xy_err = float(np.linalg.norm(np.array(est[:2]) - np.array(gt[:2])))
-            z_err = float(est[2] - gt[2])
-            err3d = float(np.linalg.norm(np.array(est) - np.array(gt)))
+            xy_err = float(np.linalg.norm(np.array(est[:2]) - gt_xy))
+            z_err = float(est[2] - gt_z_mid)
+            err3d = float(np.sqrt(xy_err ** 2 + z_err ** 2))
+            z_err_base = float(est[2] - gt[2])
             print(f"   [{name}] est=({est[0]:.3f},{est[1]:.3f},{est[2]:.3f}) "
-                  f"gt=({gt[0]:.3f},{gt[1]:.3f},{gt[2]:.3f}) | "
-                  f"XY={xy_err * 100:.1f}cm  Z={z_err * 100:+.1f}cm  3D={err3d * 100:.1f}cm")
+                  f"gt_xy=({gt_xy[0]:.3f},{gt_xy[1]:.3f}) gt_z范围=[{aabb[0][2]:.3f},{aabb[1][2]:.3f}] | "
+                  f"XY={xy_err * 100:.1f}cm  Z={z_err * 100:+.1f}cm(vs中点) "
+                  f"{z_err_base * 100:+.1f}cm(vs基座)  3D={err3d * 100:.1f}cm")
             rows.append({
                 "trial": t, "object": name, "ok": True,
                 "est": [round(float(v), 4) for v in est],
                 "gt": [round(float(v), 4) for v in gt],
+                "gt_xy": [round(float(gt_xy[0]), 4), round(float(gt_xy[1]), 4)],
+                "gt_z_range": [round(float(aabb[0][2]), 4), round(float(aabb[1][2]), 4)],
                 "xy_err_cm": round(xy_err * 100, 2),
                 "z_err_cm": round(z_err * 100, 2),
+                "z_err_base_cm": round(z_err_base * 100, 2),
                 "err3d_cm": round(err3d * 100, 2),
             })
         p.disconnect()
@@ -185,7 +195,7 @@ def summarize(pose_rows, grasp_rows, objects):
     summary = {"pose": {}, "grasp": {}}
 
     if pose_rows:
-        print("\n[定位精度]  物体        XY误差(cm)          Z偏差(cm)        3D误差(cm)   N")
+        print("\n[定位精度]  物体        XY误差(cm)          Z偏差(cm,vs AABB中点)  3D误差(cm)   N")
         for name in objects:
             rs = [r for r in pose_rows if r["object"] == name and r.get("ok")]
             if not rs:

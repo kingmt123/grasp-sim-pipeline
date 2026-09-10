@@ -87,7 +87,9 @@ def move_to_pose(
             last_ik_poses = ik_poses
 
         # ── 当前末端位置与误差 ─────────────────────────────────────
-        ee_pos = np.array(p.getLinkState(robot_id, end_effector_link_index)[0])
+        # 取 link frame（worldLinkFramePosition，索引 4）：IK 的控制目标就是 link frame；
+        # 索引 0 是 CoM（比 link frame 低 ~3.9cm），会让收敛判据永远不成立。
+        ee_pos = np.array(p.getLinkState(robot_id, end_effector_link_index)[4])
         err = np.linalg.norm(ee_pos - np.array(target_pos))
 
         # ── 自适应力和速度 ─────────────────────────────────────────
