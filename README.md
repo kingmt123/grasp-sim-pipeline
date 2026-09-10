@@ -19,15 +19,17 @@ Grasp: table_z + waist_ratio × (z_max − table_z)  (per-object ratio)
 
 ### 关键设计决策
 
-**抓取高度** — 以桌面为绝对基准：`grasp_z = TABLE_SURFACE_Z + waist_ratio × (z_max - TABLE_SURFACE_Z)`。用 table_z 而非 YOLO 点云 z_min（mask 腐蚀会使最低点偏高）。
+**抓取高度** — 按"夹持面覆盖物体"的物理规则推导（实测夹持面 0.062m）：物体比夹持面矮 → 指尖贴桌（`table_z+5mm`）使夹持面覆盖整个物体；物体更高 → 夹持面在物体上居中覆盖 `table_z + (h−0.062)/2`。`grasp_z` 即真实指尖目标，`fine_z = grasp_z + FINGER_OFFSET`。
+
+**内参** — PyBullet `computeProjectionMatrixFOV` 的 fov 是**垂直** FOV：`f = (H/2)/tan(fov/2) = 415.7px`，主点 `(320, 240)`，且图像行 v 需取负号（`y_cam = −(v−cy)·z/f`）。旧代码用 `(W/2)` 使焦距偏大 4/3 倍并靠 `cy_offset` 凑合，是 Z 长期偏高 8~12cm 的根因。
 
 **抓取偏航** — 物体类别硬编码。PCA 在单视角（透视畸变制造虚假长轴）和多视角（点云圆形化）均有根本性缺陷。
 
-| 物体 | waist_ratio | yaw | IK force | fine_steps |
+| 物体 | 抓取高度（规则推导） | yaw | IK force | fine_steps |
 |------|-------------|-----|----------|------------|
-| teddy | 25% | 90° (躺桌上，沿 X 夹窄处) | 800N | 600 |
-| duck | 20% | 0° | 500N | 600 |
-| cube | 15% | 0° | 1000N | 800 |
+| teddy | 0.630m（夹持面居中） | 90° (躺桌上，沿 X 夹窄处) | 800N | 600 |
+| duck | 0.634m（夹持面居中） | 0° | 500N | 600 |
+| cube | 0.630m（贴桌覆盖全身） | 0° | 1000N | 800 |
 
 ## 文件结构
 
@@ -78,8 +80,8 @@ uv run python scripts/batch_test_final.py --pose-trials 5 --grasp-trials 3   # �
 | 虚拟相机 | 640×480, FOV=60°, near=0.1m, far=3.0m | PyBullet 内置 |
 | TABLE_SURFACE_Z | 0.625m | 桌面高度（独立于 ROBOT_BASE_POS） |
 | ROBOT_BASE_POS | [0, 0, 0.50] | 机械臂基座（降低以扩展工作空间） |
-| FINGER_OFFSET | 0.105m | hand 关节原点到指尖距离 |
-| 融合视角 | 右侧/正前/左侧/左后 4 视角 | 固定 cy_offset=-54 |
+| FINGER_OFFSET | 0.1162m | IK 控制的 hand link frame → 真实指尖（实测；旧值 0.105 读到的是 CoM 高度） |
+| 融合视角 | 右侧/正前/左侧/左后 4 视角 | `cy_offset=0`（真主点 240，内参已修正） |
 
 ## 自定义 YOLO 模型
 
