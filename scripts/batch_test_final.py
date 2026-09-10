@@ -1,262 +1,289 @@
 # scripts/batch_test_final.py
 """
-最终批量测试：10 次位姿估计 + 5 次完整抓取。
-记录优化后（无 Z_mid 修正）的精度和成功率。
+批量统计：多视角融合定位精度 + 多物体抓取成功率。
+
+STEP12 重写说明
+--------------
+旧版本脚本自带一套与主线相反的参数（cy_offset=-6、PCA 主轴算 yaw、
+z_min + 0.35*z_range 抓取高度、force=800/500），这些结论已被 STEP10 推翻
+（PCA 不可行 → 类硬编码 yaw；抓取高度 → 桌面基准腰线）。为杜绝"测试脚本与
+主线不一致"的漂移，本版**不复制任何估计/抓取逻辑**，直接 import
+`scripts/test_multi_object_grasp.py` 并调用它的 `estimate_object_pose()` /
+`grasp_object()`；主线改一次，这里自动跟随。
+
+两阶段
+------
+Phase A 定位统计（DIRECT 渲染，快）:
+    每个物体每轮 → estimate_object_pose() 的 3D 估计 vs PyBullet GT
+    （GT 仅用于打分，不参与任何估计/抓取决策）→ 记录 XY 误差、Z 偏差
+Phase B 抓取统计（GUI，慢）:
+    成功率；判据与主线一致（轻提后物体 Δz > 1cm）
+
+用法
+----
+    uv run python scripts/batch_test_final.py --pose-trials 5 --grasp-trials 3
+    uv run python scripts/batch_test_final.py --pose-trials 5 --grasp-trials 0   # 只做定位
+    uv run python scripts/batch_test_final.py --grasp-trials 3 --jitter 0.02     # 位置抖动鲁棒性
+
+输出
+----
+    控制台汇总表 + runs/batch_stats_<时间戳>.json（runs/ 已在 .gitignore 中）
 """
 
-import math
+import argparse
+import importlib.util
+import json
 import os
-import random
+import statistics
 import sys
 import time
 
 import numpy as np
-import pybullet as p
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
-from src.configs.config import MULTI_OBJECTS_CONFIG, TABLE_SURFACE_Z
-from src.env.sim_env import setup_simulation_multi, stabilize_objects, init_panda_pose
-from src.perception.camera import get_camera_image
-from src.perception.pose_estimator import PoseEstimator
-from src.control.ik_controller import move_to_pose
-TABLE_Z = TABLE_SURFACE_Z
-FUSION_VIEWS = [
-    {"eye": [1.3,  0.0, 1.4]},
-    {"eye": [0.5, -1.0, 1.2]},
-    {"eye": [-0.2,-0.5, 1.0]},
-]
-FIXED_CY = -6
-END_EFF = 8
-FOFF = 0.105
-CLASS_NAMES = ["duck", "teddy", "cube"]
+import pybullet as p  # noqa: E402
 
-POSE_N = 10   # 位姿估计
-GRASP_N = 5   # 完整抓取
-
-# ── 多视角融合（无 Z_mid 修正） ──────────────────────────────────
-def multiview_estimate(oid, rough):
-    views = []
-    for vc in FUSION_VIEWS:
-        _, d, _, s, vm, _ = get_camera_image(eye=vc["eye"], target=rough)
-        views.append((d, s, vm))
-    if len(views) < 3:
-        return None, {}
-    est = PoseEstimator(cy_offset=FIXED_CY)
-    r = est.estimate_multiview(views, oid)
-    if r is None:
-        return None, {}
-    pos = r["position_world"]
-    # 无 Z_mid 修正 — 直接用融合质心 Z
-    stats = est.get_multiview_point_cloud_stats(views, oid)
-    grasp_params = {}
-    if stats:
-        z_min, z_range = stats["z_min"], stats["z_range"]
-        grasp_params = {"z_min": z_min, "z_range": z_range,
-                        "long_axis": stats["long_axis"]}
-    return pos, grasp_params
+from src.configs.config import MULTI_OBJECTS_CONFIG  # noqa: E402
+from src.env.sim_env import (  # noqa: E402
+    init_panda_pose,
+    setup_simulation_multi,
+    stabilize_objects,
+)
+from src.perception.detector import YoloSegmentor  # noqa: E402
 
 
-def compute_grasp_z(name, grasp_params):
-    if not grasp_params:
-        return FOFF + 0.1, 0.0
-    z_min = grasp_params["z_min"]
-    z_range = grasp_params["z_range"]
-    if name == "teddy":
-        ratio = 0.35
-    elif name == "duck":
-        ratio = 0.25
-    else:
-        ratio = 0.15
-    gz_body = z_min + ratio * z_range
-    la = grasp_params.get("long_axis", np.array([1.0, 0.0]))
-    yaw = math.atan2(-la[1], la[0])
-    return gz_body + FOFF, yaw
+def _load_main_module():
+    """按文件路径载入主线脚本（复用其估计/抓取函数，避免逻辑重复）。"""
+    path = os.path.join(REPO_ROOT, "scripts", "test_multi_object_grasp.py")
+    spec = importlib.util.spec_from_file_location("grasp_main", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["grasp_main"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
-# ── 测试 1：位姿精度 ────────────────────────────────────────────
-def test_pose_accuracy():
-    print("=" * 60)
-    print(f"  📏 位姿估计精度测试 N={POSE_N}")
-    print("=" * 60)
+MAIN = _load_main_module()
 
-    data = {n: {"errs": [], "z_errs": []} for n in CLASS_NAMES}
+MODEL_PATH = os.path.join(REPO_ROOT, "models", "custom_yolov8n_seg.pt")
+CAM_TARGET_ROUGH = [0.45, 0.0, 0.65]   # 与主线一致的固定相机指向
+ALL_OBJECTS = ["duck", "teddy", "cube"]
 
-    for run in range(POSE_N):
-        client, robot_id, obj_infos = setup_simulation_multi(gui=False)
-        rng = random.Random(42 + run)
-        placements = [[0.55, 0.35], [0.55, -0.35], [0.30, 0.00]]
-        rng.shuffle(placements)
 
-        for i, info in enumerate(obj_infos):
-            px, py = placements[i]
-            pos = [px, py, TABLE_Z + 0.02]
-            yaw = rng.uniform(0, 360)
-            q = (p.getQuaternionFromEuler([math.pi/2, 0, math.radians(yaw)])
-                 if info["name"] == "duck"
-                 else p.getQuaternionFromEuler([0, 0, math.radians(yaw)]))
-            p.resetBasePositionAndOrientation(info["obj_id"], pos, q)
-            p.resetBaseVelocity(info["obj_id"], [0, 0, 0], [0, 0, 0])
-            f = 1.5 if info["name"] == "duck" else 0.8
-            p.changeDynamics(info["obj_id"], -1, restitution=0.0, lateralFriction=f)
-        for _ in range(120):
-            p.stepSimulation()
-        for i, info in enumerate(obj_infos):
-            pos, q = p.getBasePositionAndOrientation(info["obj_id"])
-            p.resetBasePositionAndOrientation(
-                info["obj_id"], [placements[i][0], placements[i][1], pos[2]], q)
-            p.resetBaseVelocity(info["obj_id"], [0, 0, 0], [0, 0, 0])
+def build_objects_config(jitter, rng):
+    """按 config.MULTI_OBJECTS_CONFIG 构造本轮物体配置，可选 ±jitter 位置抖动。"""
+    cfgs = []
+    for cfg in MULTI_OBJECTS_CONFIG:
+        c = dict(cfg)
+        c["pos"] = list(cfg["pos"])
+        if jitter > 0:
+            c["pos"][0] += float(rng.uniform(-jitter, jitter))
+            c["pos"][1] += float(rng.uniform(-jitter, jitter))
+        cfgs.append(c)
+    return cfgs
 
+
+def _spawn(gui, jitter, rng):
+    cfgs = build_objects_config(jitter, rng)
+    client, robot_id, obj_infos = setup_simulation_multi(gui=gui, objects_config=cfgs)
+    init_panda_pose(robot_id)
+    stabilize_objects(obj_infos, steps=240)
+    return client, robot_id, obj_infos
+
+
+# ── Phase A: 定位精度 ────────────────────────────────────────────────
+def phase_pose(trials, objects, jitter, rng, detector):
+    print("\n" + "=" * 64)
+    print(f"  📐 Phase A: 多视角融合定位精度 ({trials} 轮, DIRECT 渲染)")
+    print("=" * 64)
+
+    rows = []
+    for t in range(trials):
+        client, robot_id, obj_infos = _spawn(gui=False, jitter=jitter, rng=rng)
+        print(f"\n── trial {t + 1}/{trials} ──")
         for info in obj_infos:
-            name, oid = info["name"], info["obj_id"]
-            gt = np.array(p.getBasePositionAndOrientation(oid)[0])
-            rough = list(gt)
-            pos, _ = multiview_estimate(oid, rough)
-            if pos is not None:
-                err = np.linalg.norm(pos - gt) * 100
-                z_err = (pos[2] - gt[2]) * 100
-                data[name]["errs"].append(err)
-                data[name]["z_errs"].append(z_err)
-
+            name = info["name"]
+            if name not in objects:
+                continue
+            gt = list(p.getBasePositionAndOrientation(info["obj_id"])[0])
+            est, _ = MAIN.estimate_object_pose(
+                name, MAIN.YOLO_CLASS_IDS[name], CAM_TARGET_ROUGH, detector
+            )
+            if est is None:
+                print(f"   [{name}] ❌ 估计失败")
+                rows.append({"trial": t, "object": name, "ok": False})
+                continue
+            xy_err = float(np.linalg.norm(np.array(est[:2]) - np.array(gt[:2])))
+            z_err = float(est[2] - gt[2])
+            err3d = float(np.linalg.norm(np.array(est) - np.array(gt)))
+            print(f"   [{name}] est=({est[0]:.3f},{est[1]:.3f},{est[2]:.3f}) "
+                  f"gt=({gt[0]:.3f},{gt[1]:.3f},{gt[2]:.3f}) | "
+                  f"XY={xy_err * 100:.1f}cm  Z={z_err * 100:+.1f}cm  3D={err3d * 100:.1f}cm")
+            rows.append({
+                "trial": t, "object": name, "ok": True,
+                "est": [round(float(v), 4) for v in est],
+                "gt": [round(float(v), 4) for v in gt],
+                "xy_err_cm": round(xy_err * 100, 2),
+                "z_err_cm": round(z_err * 100, 2),
+                "err3d_cm": round(err3d * 100, 2),
+            })
         p.disconnect()
-        if (run + 1) % 5 == 0:
-            print(f"  Run {run+1}/{POSE_N} done")
-
-    print(f"\n{'='*60}")
-    print(f"  📊 位姿误差 (无 Z_mid 修正)")
-    print(f"{'='*60}")
-    print(f"  {'物体':>8s}  {'均值±σ':>12s}  {'Z偏差均值':>10s}  {'最小':>6s}  {'最大':>6s}")
-    print(f"  {'-'*44}")
-    for name in CLASS_NAMES:
-        v = data[name]["errs"]
-        zv = data[name]["z_errs"]
-        if v:
-            m, s, lo, hi = np.mean(v), np.std(v), min(v), max(v)
-            z_m = np.mean(zv)
-            print(f"  {name:>8s}  {m:>5.1f}±{s:>4.1f}  {z_m:>+7.1f}cm  {lo:>5.1f}  {hi:>5.1f}")
-    return data
+    return rows
 
 
-# ── 测试 2：抓取测试 ────────────────────────────────────────────
-def test_grasp():
-    print(f"\n{'='*60}")
-    print(f"  🎯 抓取测试 N={GRASP_N}")
-    print(f"{'='*60}")
+# ── Phase B: 抓取成功率 ──────────────────────────────────────────────
+def phase_grasp(trials, objects, jitter, rng, detector):
+    print("\n" + "=" * 64)
+    print(f"  🤖 Phase B: 多物体抓取成功率 ({trials} 轮, GUI, 成功判据 Δz>1cm)")
+    print("=" * 64)
 
-    results = {n: {"ok": 0, "total": 0, "errs": [], "dzs": []} for n in CLASS_NAMES}
+    rows = []
+    for t in range(trials):
+        client, robot_id, obj_infos = _spawn(gui=True, jitter=jitter, rng=rng)
+        print(f"\n── trial {t + 1}/{trials} ──")
+        for idx, info in enumerate(obj_infos):
+            name = info["name"]
+            if name not in objects:
+                continue
+            if idx > 0:
+                init_panda_pose(robot_id)
+                MAIN.wait(steps=60)
 
-    for run in range(GRASP_N):
-        client, robot_id, obj_infos = setup_simulation_multi(gui=True)
-        stabilize_objects(obj_infos, steps=240)
-        init_panda_pose(robot_id)
-
-        for info in obj_infos:
-            name, oid = info["name"], info["obj_id"]
-            gt = np.array(p.getBasePositionAndOrientation(oid)[0])
-            rough = list(gt)
-
-            pos, gp = multiview_estimate(oid, rough)
-            if pos is None:
+            est, grasp_params = MAIN.estimate_object_pose(
+                name, MAIN.YOLO_CLASS_IDS[name], CAM_TARGET_ROUGH, detector
+            )
+            if est is None:
+                print(f"   [{name}] ❌ 位姿估计失败")
+                rows.append({"trial": t, "object": name, "success": False,
+                             "error": "pose_estimation_failed"})
                 continue
 
-            err = np.linalg.norm(pos - gt) * 100
-            results[name]["errs"].append(err)
-
-            gz, gyaw = compute_grasp_z(name, gp)
-            dq = p.getQuaternionFromEuler([math.pi, 0, gyaw])
-            ox, oy = pos[0], pos[1]
-
-            move_to_pose(robot_id, [ox, oy, gz+0.20], target_quat=dq,
-                         end_effector_link_index=END_EFF, steps=200)
-            move_to_pose(robot_id, [ox, oy, gz+0.05], target_quat=dq,
-                         end_effector_link_index=END_EFF, steps=200)
-            move_to_pose(robot_id, [ox, oy, gz], target_quat=dq,
-                         end_effector_link_index=END_EFF, steps=600,
-                         convergence_threshold=2e-3)
-            for _ in range(60):
-                p.stepSimulation()
-                time.sleep(1/240)
-
-            gforce = 800 if name == "teddy" else 500
-            for j in [9, 10]:
-                p.setJointMotorControl2(robot_id, j, p.POSITION_CONTROL,
-                                        targetPosition=0.0, force=gforce)
-            for _ in range(250):
-                p.stepSimulation()
-                time.sleep(1/240)
-            for _ in range(120):
-                p.stepSimulation()
-                time.sleep(1/240)
-
-            obj_z0 = p.getBasePositionAndOrientation(oid)[0][2]
-            move_to_pose(robot_id, [ox, oy, gz+0.05], target_quat=dq,
-                         end_effector_link_index=END_EFF, steps=150)
-            for _ in range(120):
-                p.stepSimulation()
-                time.sleep(1/240)
-            dz = (p.getBasePositionAndOrientation(oid)[0][2] - obj_z0) * 100
-
-            results[name]["total"] += 1
-            results[name]["dzs"].append(dz)
-            success = dz > 1.0
-            if success:
-                results[name]["ok"] += 1
-
-            status = "✅" if success else "❌"
-            print(f"  [{run+1}/{GRASP_N}] {name}: {status} err={err:.1f}cm dz={dz:.1f}cm")
-
-            # 松开
-            for j in [9, 10]:
-                p.setJointMotorControl2(robot_id, j, p.POSITION_CONTROL,
-                                        targetPosition=0.04, force=350)
-            for _ in range(100):
-                p.stepSimulation()
-
-            init_panda_pose(robot_id)
-
-        p.disconnect()
-        print(f"  Run {run+1}/{GRASP_N} done")
-
-    print(f"\n{'='*60}")
-    print(f"  📊 抓取成功率")
-    print(f"{'='*60}")
-    print(f"  {'物体':>8s}  {'成功/总数':>10s}  {'成功率':>8s}  {'均值误差':>10s}  {'均值Δz':>8s}")
-    print(f"  {'-'*48}")
-    for name in CLASS_NAMES:
-        r = results[name]
-        rate = r["ok"]/max(r["total"],1)*100
-        me = np.mean(r["errs"]) if r["errs"] else 0
-        mdz = np.mean(r["dzs"]) if r["dzs"] else 0
-        print(f"  {name:>8s}  {r['ok']}/{r['total']:<5d}  {rate:>6.0f}%   {me:>5.1f}cm    {mdz:>5.1f}cm")
-    ts = sum(r["ok"] for r in results.values())
-    tt = sum(r["total"] for r in results.values())
-    print(f"  {'-'*48}")
-    print(f"  {'总计':>8s}  {ts}/{tt:<5d}  {ts/max(tt,1)*100:>6.0f}%")
-
-    return results
+            try:
+                ok = bool(MAIN.grasp_object(robot_id, info["obj_id"], name, est, grasp_params))
+            except Exception as exc:  # noqa: BLE001
+                print(f"   [{name}] ❌ 抓取异常: {exc}")
+                ok = False
+                if "Not connected" in str(exc):
+                    rows.append({"trial": t, "object": name, "success": False,
+                                 "error": "simulation_disconnected"})
+                    print("   ⚠️  PyBullet 断开，终止本轮")
+                    break
+            rows.append({"trial": t, "object": name, "success": ok})
+        try:
+            p.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+    return rows
 
 
-# ── 主流程 ──────────────────────────────────────────────────────
+def summarize(pose_rows, grasp_rows, objects):
+    print("\n" + "=" * 64)
+    print("  📊 批量统计汇总")
+    print("=" * 64)
+
+    summary = {"pose": {}, "grasp": {}}
+
+    if pose_rows:
+        print("\n[定位精度]  物体        XY误差(cm)          Z偏差(cm)        3D误差(cm)   N")
+        for name in objects:
+            rs = [r for r in pose_rows if r["object"] == name and r.get("ok")]
+            if not rs:
+                continue
+            xy = [r["xy_err_cm"] for r in rs]
+            zs = [r["z_err_cm"] for r in rs]
+            e3 = [r["err3d_cm"] for r in rs]
+            f = lambda v: f"{statistics.mean(v):.2f}±{statistics.pstdev(v):.2f}"  # noqa: E731
+            print(f"              {name:<8} {f(xy):<18} {f(zs):<17} {f(e3):<11} {len(rs)}")
+            summary["pose"][name] = {
+                "n": len(rs),
+                "xy_err_cm_mean": round(statistics.mean(xy), 3),
+                "xy_err_cm_std": round(statistics.pstdev(xy), 3),
+                "z_err_cm_mean": round(statistics.mean(zs), 3),
+                "z_err_cm_std": round(statistics.pstdev(zs), 3),
+                "err3d_cm_mean": round(statistics.mean(e3), 3),
+            }
+        failed = [r for r in pose_rows if not r.get("ok")]
+        if failed:
+            print(f"              ⚠️ 估计失败 {len(failed)} 次")
+
+    if grasp_rows:
+        print("\n[抓取成功率]")
+        total_ok = total = 0
+        for name in objects:
+            rs = [r for r in grasp_rows if r["object"] == name]
+            if not rs:
+                continue
+            ok = sum(1 for r in rs if r["success"])
+            total_ok += ok
+            total += len(rs)
+            print(f"              {name:<8} {ok}/{len(rs)}  ({ok / len(rs) * 100:.0f}%)")
+            summary["grasp"][name] = {"success": ok, "n": len(rs),
+                                      "rate": round(ok / len(rs), 3)}
+        if total:
+            print(f"              {'总计':<8} {total_ok}/{total}  ({total_ok / total * 100:.0f}%)")
+            summary["grasp"]["overall"] = {"success": total_ok, "n": total,
+                                           "rate": round(total_ok / total, 3)}
+    return summary
+
+
 def main():
-    # Phase 1: 位姿精度 (10x, DIRECT)
-    pose_data = test_pose_accuracy()
+    ap = argparse.ArgumentParser(description="多视角定位精度 + 抓取成功率批量统计")
+    ap.add_argument("--pose-trials", type=int, default=5, help="Phase A 轮数（DIRECT）")
+    ap.add_argument("--grasp-trials", type=int, default=3, help="Phase B 轮数（GUI）")
+    ap.add_argument("--objects", default=",".join(ALL_OBJECTS), help="逗号分隔物体名")
+    ap.add_argument("--jitter", type=float, default=0.0,
+                    help="物体初始位置 ±抖动（米），0=固定复现配置")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
-    # Phase 2: 抓取 (5x, GUI)
-    grasp_data = test_grasp()
+    objects = [s.strip() for s in args.objects.split(",") if s.strip()]
+    rng = np.random.default_rng(args.seed)
 
-    # 汇总
-    print(f"\n{'='*60}")
-    print(f"  📈 最终汇总")
-    print(f"{'='*60}")
-    print(f"  {'物体':>8s}  {'位姿误差':>10s}  {'Z偏差':>8s}  {'抓取率':>8s}  {'提升(vs单视角)':>14s}")
-    print(f"  {'-'*52}")
-    for name in CLASS_NAMES:
-        pe = np.mean(pose_data[name]["errs"]) if pose_data[name]["errs"] else 0
-        ze = np.mean(pose_data[name]["z_errs"]) if pose_data[name]["z_errs"] else 0
-        gr = grasp_data[name]["ok"]/max(grasp_data[name]["total"],1)*100
-        print(f"  {name:>8s}  {pe:>5.1f}±{np.std(pose_data[name]['errs']):.1f}  {ze:>+5.1f}cm  {gr:>5.0f}%   "
-              f"82~94%")
-    print(f"\n  关键改进: 禁用 Z_mid 修正 + 固定 cy_offset=-6 + 分物体抓取参数")
+    print("=" * 64)
+    print("  📊 批量统计: 定位精度 + 抓取成功率")
+    print(f"  物体={objects}  pose-trials={args.pose_trials}  "
+          f"grasp-trials={args.grasp_trials}  jitter=±{args.jitter}m  seed={args.seed}")
+    print("=" * 64)
+
+    t0 = time.time()
+    print(f"\n🤖 加载 YOLO 模型 ({os.path.relpath(MODEL_PATH, REPO_ROOT)})...")
+    detector = YoloSegmentor(model_path=MODEL_PATH)
+
+    pose_rows = []
+    if args.pose_trials > 0:
+        pose_rows = phase_pose(args.pose_trials, objects, args.jitter, rng, detector)
+
+    grasp_rows = []
+    if args.grasp_trials > 0:
+        grasp_rows = phase_grasp(args.grasp_trials, objects, args.jitter, rng, detector)
+
+    summary = summarize(pose_rows, grasp_rows, objects)
+
+    out = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "config": {
+            "objects": objects,
+            "pose_trials": args.pose_trials,
+            "grasp_trials": args.grasp_trials,
+            "jitter_m": args.jitter,
+            "seed": args.seed,
+            "model": os.path.relpath(MODEL_PATH, REPO_ROOT),
+        },
+        "summary": summary,
+        "pose_rows": pose_rows,
+        "grasp_rows": grasp_rows,
+        "wall_seconds": round(time.time() - t0, 1),
+    }
+    runs_dir = os.path.join(REPO_ROOT, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    out_path = os.path.join(runs_dir, f"batch_stats_{time.strftime('%Y%m%d_%H%M%S')}.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False, indent=2)
+
+    print(f"\n⏱️  总耗时 {out['wall_seconds']}s")
+    print(f"💾 明细 → {out_path}")
+    print("\n👋 完成")
 
 
 if __name__ == "__main__":

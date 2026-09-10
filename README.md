@@ -48,7 +48,7 @@ scripts/
 ├── test_multi_object_detection.py # 多物体检测 + 位姿估计
 ├── generate_yolo_dataset.py     # YOLO 训练数据生成
 ├── train_yolo_custom.py         # 自定义 YOLO 训练
-├── batch_test_final.py          # 批量测试
+├── batch_test_final.py          # 批量统计：定位精度 + 抓取成功率（复用主线函数）
 ├── diagnose_duck_grasp.py       # 鸭子诊断
 ├── diagnose_centroid.py         # 单视角诊断
 ├── test_pose_estimation.py      # 位姿估计验证
@@ -68,7 +68,7 @@ uv run python scripts/test_multi_object.py           # 多物体环境加载验�
 uv run python scripts/test_multi_object_detection.py # 多物体检测 + 位姿估计
 uv run python scripts/generate_yolo_dataset.py       # YOLO 训练数据生成
 uv run python scripts/train_yolo_custom.py           # YOLO 训练
-uv run python scripts/batch_test_final.py            # 批量性能测试
+uv run python scripts/batch_test_final.py --pose-trials 5 --grasp-trials 3   # 批量统计（定位精度 + 抓取成功率）
 ```
 
 ## 关键参数
