@@ -1,0 +1,7 @@
+names:
+  0: duck
+  1: teddy
+  2: cube
+path: D:\aREBOTicsProject\grasp-sim-pipeline\yolo_dataset
+train: images/train
+val: images/val
