@@ -33,6 +33,7 @@ Phase B 抓取统计（GUI，慢）:
 import argparse
 import importlib.util
 import json
+import math
 import os
 import statistics
 import sys
@@ -71,36 +72,52 @@ CAM_TARGET_ROUGH = [0.45, 0.0, 0.65]   # 与主线一致的固定相机指向
 ALL_OBJECTS = ["duck", "teddy", "cube"]
 
 
-def build_objects_config(jitter, rng):
-    """按 config.MULTI_OBJECTS_CONFIG 构造本轮物体配置，可选 ±jitter 位置抖动。"""
+def build_objects_config(jitter, rng, rot_deg=0.0):
+    """按 config.MULTI_OBJECTS_CONFIG 构造本轮物体配置。
+
+    rot_deg: 额外绕世界 Z 施加的偏航（度）——用于测试偏航敏感性。
+    注意 stabilize_objects() 会把朝向重置为单位四元数，因此 _spawn 会重新施加。
+    """
     cfgs = []
     for cfg in MULTI_OBJECTS_CONFIG:
         c = dict(cfg)
         c["pos"] = list(cfg["pos"])
+        c["euler"] = list(cfg["euler"])
         if jitter > 0:
             c["pos"][0] += float(rng.uniform(-jitter, jitter))
             c["pos"][1] += float(rng.uniform(-jitter, jitter))
+        if rot_deg:
+            c["euler"][2] += rot_deg
         cfgs.append(c)
     return cfgs
 
 
-def _spawn(gui, jitter, rng):
-    cfgs = build_objects_config(jitter, rng)
+def _spawn(gui, jitter, rng, rot_deg=0.0):
+    cfgs = build_objects_config(jitter, rng, rot_deg)
     client, robot_id, obj_infos = setup_simulation_multi(gui=gui, objects_config=cfgs)
     init_panda_pose(robot_id)
     stabilize_objects(obj_infos, steps=240)
+    if rot_deg:
+        # stabilize_objects 把朝向重置为 identity → 重新施加配置朝向并让其落定
+        for info, cfg in zip(obj_infos, cfgs):
+            quat = p.getQuaternionFromEuler([math.radians(a) for a in cfg["euler"]])
+            pos_now = p.getBasePositionAndOrientation(info["obj_id"])[0]
+            p.resetBasePositionAndOrientation(info["obj_id"], pos_now, quat)
+            p.resetBaseVelocity(info["obj_id"], [0, 0, 0], [0, 0, 0])
+        for _ in range(120):
+            p.stepSimulation()
     return client, robot_id, obj_infos
 
 
 # ── Phase A: 定位精度 ────────────────────────────────────────────────
-def phase_pose(trials, objects, jitter, rng, detector):
+def phase_pose(trials, objects, jitter, rng, detector, rot=0.0):
     print("\n" + "=" * 64)
     print(f"  📐 Phase A: 多视角融合定位精度 ({trials} 轮, DIRECT 渲染)")
     print("=" * 64)
 
     rows = []
     for t in range(trials):
-        client, robot_id, obj_infos = _spawn(gui=False, jitter=jitter, rng=rng)
+        client, robot_id, obj_infos = _spawn(gui=False, jitter=jitter, rng=rng, rot_deg=rot)
         print(f"\n── trial {t + 1}/{trials} ──")
         for info in obj_infos:
             name = info["name"]
@@ -143,14 +160,14 @@ def phase_pose(trials, objects, jitter, rng, detector):
 
 
 # ── Phase B: 抓取成功率 ──────────────────────────────────────────────
-def phase_grasp(trials, objects, jitter, rng, detector):
+def phase_grasp(trials, objects, jitter, rng, detector, rot=0.0):
     print("\n" + "=" * 64)
     print(f"  🤖 Phase B: 多物体抓取成功率 ({trials} 轮, GUI, 成功判据 Δz>1cm)")
     print("=" * 64)
 
     rows = []
     for t in range(trials):
-        client, robot_id, obj_infos = _spawn(gui=True, jitter=jitter, rng=rng)
+        client, robot_id, obj_infos = _spawn(gui=True, jitter=jitter, rng=rng, rot_deg=rot)
         print(f"\n── trial {t + 1}/{trials} ──")
         for idx, info in enumerate(obj_infos):
             name = info["name"]
@@ -245,6 +262,8 @@ def main():
     ap.add_argument("--jitter", type=float, default=0.0,
                     help="物体初始位置 ±抖动（米），0=固定复现配置")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--rot", type=float, default=0.0,
+                    help="额外绕 Z 施加的物体偏航（度）：测偏航敏感性；0=配置原样")
     args = ap.parse_args()
 
     objects = [s.strip() for s in args.objects.split(",") if s.strip()]
@@ -253,7 +272,8 @@ def main():
     print("=" * 64)
     print("  📊 批量统计: 定位精度 + 抓取成功率")
     print(f"  物体={objects}  pose-trials={args.pose_trials}  "
-          f"grasp-trials={args.grasp_trials}  jitter=±{args.jitter}m  seed={args.seed}")
+          f"grasp-trials={args.grasp_trials}  jitter=±{args.jitter}m  "
+          f"rot={args.rot:+.1f}°  seed={args.seed}")
     print("=" * 64)
 
     t0 = time.time()
@@ -262,11 +282,11 @@ def main():
 
     pose_rows = []
     if args.pose_trials > 0:
-        pose_rows = phase_pose(args.pose_trials, objects, args.jitter, rng, detector)
+        pose_rows = phase_pose(args.pose_trials, objects, args.jitter, rng, detector, args.rot)
 
     grasp_rows = []
     if args.grasp_trials > 0:
-        grasp_rows = phase_grasp(args.grasp_trials, objects, args.jitter, rng, detector)
+        grasp_rows = phase_grasp(args.grasp_trials, objects, args.jitter, rng, detector, args.rot)
 
     summary = summarize(pose_rows, grasp_rows, objects)
 
@@ -277,6 +297,7 @@ def main():
             "pose_trials": args.pose_trials,
             "grasp_trials": args.grasp_trials,
             "jitter_m": args.jitter,
+            "rot_deg": args.rot,
             "seed": args.seed,
             "model": os.path.relpath(MODEL_PATH, REPO_ROOT),
         },
