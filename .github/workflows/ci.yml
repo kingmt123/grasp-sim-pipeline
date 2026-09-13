@@ -1,12 +1,13 @@
 name: CI
 
-# 注意：用 flow-style 书写触发条件，避免个别 YAML 1.1 解析器把 `on:` 当布尔键
-# （本仓库曾出现 push 不触发、只能手动 dispatch 的情况）
-on: [push, pull_request, workflow_dispatch]
-
-# 定时兜底：即使触发事件被平台侧抑制，每周也会跑一次
-schedule:
-  - cron: "0 3 * * 1"
+# 注意：schedule 必须放在 on: 映射内部；写成顶层键会让 workflow 解析失败（422），
+# 后果是**任何**事件都不触发（本仓库踩过：push 一直无 run，dispatch 报 500/422）
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC 兜底跑一次
 
 jobs:
   test:
