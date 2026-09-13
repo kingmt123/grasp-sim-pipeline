@@ -1,7 +1,8 @@
+# 训练数据集配置（由 scripts/generate_yolo_dataset.py 生成）
+# 不写 path：ultralytics 以本文件所在目录为数据集根目录 → 整个 yolo_dataset/ 可任意挪动
 names:
   0: duck
   1: teddy
   2: cube
-path: D:\aREBOTicsProject\grasp-sim-pipeline\yolo_dataset
 train: images/train
 val: images/val

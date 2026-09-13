@@ -225,8 +225,9 @@ def main():
             print(f"   进度: {i + 1}/{total}  ({split}: img_{i:06d}, {visible_count} objects)")
 
     # ── 3. 生成 dataset.yaml ─────────────────────────────────────────
+    # 不写 "path"：ultralytics 会以 yaml 所在目录为数据集根目录。
+    # 写绝对路径（原实现）会导致拷到别的机器/用户后直接失败。
     data_yaml = {
-        "path": os.path.abspath(OUTPUT_DIR),
         "train": "images/train",
         "val": "images/val",
         "names": {i: name for i, name in enumerate(CLASS_NAMES)},

@@ -1,6 +1,35 @@
 # Grasp Simulation Pipeline
 
-PyBullet + Franka Panda 机械臂视觉引导抓取。使用 YOLOv8n-seg 进行 mask 提取，4 视角迭代融合定位，自适应物体形状的抓取高度与偏航。
+PyBullet + Franka Panda 机械臂视觉引导抓取。使用 YOLOv8n-seg 进行 mask 提取，4 视角迭代融合定位，按"夹持面覆盖物体"物理规则推导抓取高度。
+
+![demo](docs/demo.gif)
+
+*演示：4 视角融合定位 → IK 接近/精细下降 → 夹爪闭合 → 轻提验证（3/3）。用 `scripts/record_demo.py` 无 GUI 程序化录制（DIRECT + 软件渲染 + 每 8 仿真步抓帧），可重复生成。*
+
+## 实测结果（PyBullet 仿真 / 3 类物体 / CPU）
+
+| 指标 | 结果 | 复现命令 |
+|---|---|---|
+| 抓取成功率（固定配置 n=10） | **30/30 (100%)** | `--grasp-trials 10` |
+| 抓取成功率（±2cm 位置抖动 n=10） | **29/30 (97%)** | `--grasp-trials 10 --jitter 0.02` |
+| 抓取成功率（+45° 整体旋转 n=2） | **6/6 (100%)** | `--grasp-trials 2 --rot 45` |
+| 定位精度 XY（duck/teddy/cube） | **0.75 / 1.37 / 0.92 cm** | `--pose-trials 5` |
+| 定位精度 Z（vs GT AABB 中点） | **+0.12 / +0.73 / +0.82 cm** | 同上 |
+| 逐视角 Z 一致性 | **0.3–0.4 cm** | `scripts/diagnose_z_bias.py` |
+| 分割模型（自建 200 图仿真集） | box mAP50 **0.995** / mask mAP50-95 **0.881** | `scripts/train_yolo_custom.py` |
+
+> 口径：成功判据 = 轻提后物体 Δz > 1cm；以上均为**仿真内**结果，**无真机验证**。
+> 定位精度以 GT **AABB 中点**为参照（点云质心是"可见表面"质心，与 URDF 基座原点天然差半个物体高度）。
+
+## 测试与 CI
+
+```bash
+python -m pytest -q      # 10 个回归测试，约 15s，无 GUI（DIRECT 渲染）
+```
+
+`tests/test_regression.py` 把历史上 4 类"能跑通但系统性错误"的缺陷固化成护栏：相机内参模型（垂直 FOV / 焦距尺度）、
+反投影 y 轴符号、IK 目标坐标系（link frame vs 质心 CoM）、末端指尖几何；另含 rayTest 物理真值对照与端到端定位冒烟测试。
+CI（`.github/workflows/ci.yml`）在 Ubuntu + Python 3.12 上跑同一套测试。
 
 ## 架构
 
@@ -54,11 +83,20 @@ scripts/
 ├── diagnose_duck_grasp.py       # 鸭子诊断
 ├── diagnose_centroid.py         # 单视角诊断
 ├── test_pose_estimation.py      # 位姿估计验证
-└── test_move.py                 # 基础运动测试
+├── test_move.py                 # 基础运动测试
+├── diagnose_z_bias.py           # Z 偏高根因诊断（内参/深度轴/融合口径）
+├── diagnose_finger_geometry.py  # 末端真实几何实测（CoM vs link frame、指尖、夹持面）
+├── diagnose_yaw.py              # 偏航可观测性诊断
+├── sweep_grasp_height.py        # 抓取高度扫描（标定用）
+└── record_demo.py               # 无 GUI 程序化录制演示 → docs/demo.gif|mp4
+tests/                           # pytest 回归护栏（无 GUI，10 个测试）
+.github/workflows/ci.yml         # CI：Ubuntu + Python 3.12
 models/
 ├── custom_yolov8n_seg.pt        # 训练好的 YOLO 模型
 └── yolo_duck_teddy_cube/        # 训练日志
-yolo_dataset/                    # 训练数据集
+yolo_dataset/                    # 训练数据集（200 图，标签与图像成对入库）
+docs/                            # 文档与演示媒体（demo.gif / demo.mp4）
+LICENSE                          # MIT
 ```
 
 ## 使用
