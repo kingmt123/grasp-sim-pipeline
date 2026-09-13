@@ -1,5 +1,9 @@
 # Grasp Simulation Pipeline
 
+![CI](https://github.com/kingmt123/grasp-sim-pipeline/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 PyBullet + Franka Panda 机械臂视觉引导抓取。使用 YOLOv8n-seg 进行 mask 提取，4 视角迭代融合定位，按"夹持面覆盖物体"物理规则推导抓取高度。
 
 ![demo](docs/demo.gif)
