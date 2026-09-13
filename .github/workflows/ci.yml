@@ -14,9 +14,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -34,12 +34,10 @@ jobs:
       # 依赖只从 pyproject.toml 读一次 → 不在 CI 里手抄版本，避免与本地漂移
       - name: 安装依赖
         run: |
-          python - <<'PY' > /tmp/reqs.txt
-          import pathlib, tomllib
-          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
-          print("\n".join(data["project"]["dependencies"]))
-          PY
+          python -c "import pathlib, tomllib; print(chr(10).join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']))" > /tmp/reqs.txt
           python -m pip install --upgrade pip
+          # 先装 CPU 版 torch（Linux 上 PyPI 默认 wheel 会拖 ~2.5GB CUDA 库，CI 只需要 CPU）
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r /tmp/reqs.txt pytest
 
       # 全部测试跑 DIRECT（headless），不需要显示器/GUI
