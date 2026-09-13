@@ -20,6 +20,9 @@ PyBullet + Franka Panda 机械臂视觉引导抓取。使用 YOLOv8n-seg 进行 
 
 > 口径：成功判据 = 轻提后物体 Δz > 1cm；以上均为**仿真内**结果，**无真机验证**。
 > 定位精度以 GT **AABB 中点**为参照（点云质心是"可见表面"质心，与 URDF 基座原点天然差半个物体高度）。
+>
+> 许可说明：本仓库代码为 MIT；`models/custom_yolov8n_seg.pt` 由 ultralytics **YOLOv8n-seg**（AGPL-3.0）在自建仿真集上微调而来，
+> 沿用其许可证；如需宽松许可，用 `scripts/train_yolo_custom.py` 重新训练或替换为其他模型即可。
 
 ## 测试与 CI
 
