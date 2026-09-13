@@ -37,8 +37,9 @@ jobs:
         run: |
           python -c "import pathlib, tomllib; print(chr(10).join(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['dependencies']))" > /tmp/reqs.txt
           python -m pip install --upgrade pip
-          # 先装 CPU 版 torch（Linux 上 PyPI 默认 wheel 会拖 ~2.5GB CUDA 库，CI 只需要 CPU）
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # torch + torchvision 必须同源安装：只装 CPU 版 torch、torchvision 走 PyPI 会出现
+          # "operator torchvision::nms does not exist"（C++ 扩展与 torch 二进制不匹配）
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r /tmp/reqs.txt pytest
 
       # 全部测试跑 DIRECT（headless），不需要显示器/GUI
