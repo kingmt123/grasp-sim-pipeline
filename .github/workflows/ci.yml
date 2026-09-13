@@ -1,9 +1,12 @@
 name: CI
 
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
+# 注意：用 flow-style 书写触发条件，避免个别 YAML 1.1 解析器把 `on:` 当布尔键
+# （本仓库曾出现 push 不触发、只能手动 dispatch 的情况）
+on: [push, pull_request, workflow_dispatch]
+
+# 定时兜底：即使触发事件被平台侧抑制，每周也会跑一次
+schedule:
+  - cron: "0 3 * * 1"
 
 jobs:
   test:
