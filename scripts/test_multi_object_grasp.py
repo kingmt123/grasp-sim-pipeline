@@ -54,6 +54,19 @@ END_EFFECTOR_INDEX = 8   # panda_hand
 #   历史上被误读成"IK 工作空间极限 3.9cm 残差"，并据此塞了 ik_bias 补偿。
 FINGER_OFFSET = 0.1162
 
+# ── 成功判据（严格版，可归因）────────────────────────────────────────
+# 旧判据只有 Δz > 1cm：历史上曾把"贴桌支助/被顶起"判成成功，且失败时无法区分原因。
+# 新判据要求同时满足：
+#   1) 提升 Δz > 1cm
+#   2) 抬到高位保持 HOLD_STEPS 步不滑落（Δz 仍 > 1cm）
+#   3) 夹爪开度 > MIN_GRIP_MM（两指间确实有物体，而不是空夹）
+#   4) 保持结束时物体不再接触支撑面（桌面/地面）
+# 设 GRASP_LEGACY_CRITERION=1 可退回旧判据（用于前后对比）。
+MIN_DELTA_Z_CM = 1.0
+MIN_GRIP_MM = 5.0
+HOLD_STEPS = 240
+LEGACY_CRITERION = os.environ.get("GRASP_LEGACY_CRITERION", "0") == "1"
+
 # 融合视角（变高度，指向目标物体）
 FUSION_VIEWS_CONFIG = [
     {"eye": [1.3,  0.0, 1.4]},   # 右侧高位
@@ -89,6 +102,32 @@ def wait(steps=120):
     for _ in range(steps):
         p.stepSimulation()
         time.sleep(1.0 / 240.0)
+
+
+def grip_aperture_mm(robot_id):
+    """夹爪开度（mm）= 两指位移之和 × 1000（Panda 手指为棱柱关节，指间距离 = 2×位移）。"""
+    return (p.getJointState(robot_id, 9)[0] + p.getJointState(robot_id, 10)[0]) * 1000.0
+
+
+def hold_grip(robot_id, force, steps):
+    """保持夹持（继续压向 0）并步进，用于检验是否滑落。"""
+    for _ in range(steps):
+        for j in (9, 10):
+            p.setJointMotorControl2(robot_id, j, p.POSITION_CONTROL,
+                                    targetPosition=0.0, force=force)
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
+
+
+def support_contacts(robot_id, obj_id):
+    """物体与"非机械臂、非自身"物体的接触数（>0 说明还压在桌面/地面上）。"""
+    n = 0
+    for other in range(p.getNumBodies()):
+        if other in (obj_id, robot_id):
+            continue
+        if p.getContactPoints(obj_id, other):
+            n += 1
+    return n
 
 
 def estimate_object_pose(obj_name, target_class_id, _obj_pos_rough, yolo_detector):
@@ -476,7 +515,7 @@ def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
             print(f"      ↻ retry {retry+1}/{MAX_RETRIES}: hand_Z={new_z:.3f} "
                   f"fingertip_Z={new_z-FINGER_OFFSET:.3f}")
 
-    # ---- 轻提验证 ----
+    # ---- 轻提验证（严格判据，可归因）----
     obj_z_before = p.getBasePositionAndOrientation(obj_id)[0][2]
     verify_z = fine_z + 0.05
     move_to_pose(robot_id, [ox, oy, verify_z], target_quat=down_quat,
@@ -486,10 +525,32 @@ def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
     obj_z_after = p.getBasePositionAndOrientation(obj_id)[0][2]
     delta_z = (obj_z_after - obj_z_before) * 100
 
-    if delta_z > 1.0:
-        print(f"      ✅ 抓取成功！物体上升 Δz={delta_z:.1f}cm")
+    # 抬到高位并保持 HOLD_STEPS：检验"滑落"与"是否脱离支撑面"
+    lift_z = verify_z + 0.15
+    move_to_pose(robot_id, [ox, oy, lift_z], target_quat=down_quat,
+                 end_effector_link_index=END_EFFECTOR_INDEX, steps=300)
+    hold_grip(robot_id, pset["force"], HOLD_STEPS)
+    obj_z_hold = p.getBasePositionAndOrientation(obj_id)[0][2]
+    delta_z_hold = (obj_z_hold - obj_z_before) * 100
+    grip_mm = grip_aperture_mm(robot_id)
+    support = support_contacts(robot_id, obj_id)
 
-        # 先拍照 — 即使后续崩溃也有记录
+    checks = {
+        "dz": delta_z > MIN_DELTA_Z_CM,            # 压根没提起来
+        "slipped": delta_z_hold > MIN_DELTA_Z_CM,  # 提起来但保持阶段滑落
+        "empty_grip": grip_mm > MIN_GRIP_MM,       # 空夹（两指间没东西）
+        "on_support": support == 0,                # 仍压在桌面/地面上
+    }
+    strict_ok = all(checks.values())
+    ok = (delta_z > MIN_DELTA_Z_CM) if LEGACY_CRITERION else strict_ok
+    reason = "ok" if ok else next(k for k, v in checks.items() if not v)
+    print(f"      判据: Δz={delta_z:+.1f}cm 保持={delta_z_hold:+.1f}cm "
+          f"夹持开度={grip_mm:.0f}mm 支撑接触={support} → "
+          f"{'✅ 成功' if ok else '❌ 失败[' + reason + ']'}"
+          f"{'  (legacy 判据)' if LEGACY_CRITERION else ''}")
+
+    if ok:
+        # 快照 — 即使后续崩溃也有记录
         save_path = os.path.join(ASSETS_DIR, f"grasp_{obj_name}.png")
         view_matrix = p.computeViewMatrix(
             [1.2, -0.8, 1.3], [ox, oy, verify_z], [0, 0, 1]
@@ -505,20 +566,15 @@ def grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params):
         cv2.imwrite(save_path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         print(f"      📸 快照 → {save_path}")
 
-        # 平滑提升 + 松开（避免突然的夹爪张开和大幅关节摆动）
-        # 先继续抬高 15cm，给物体足够的离地空间
-        lift_z = verify_z + 0.15
-        move_to_pose(robot_id, [ox, oy, lift_z], target_quat=down_quat,
-                     end_effector_link_index=END_EFFECTOR_INDEX, steps=300)
-        # 在较高位置松开夹爪（物体下落距离短，视觉更自然）
-        control_gripper(robot_id, open_width=0.04, steps=100)
-        wait(steps=60)
+    # 松开夹爪（成功/失败都要，保证下一次尝试干净）
+    control_gripper(robot_id, open_width=0.04, steps=100)
+    wait(steps=60)
 
-        return True
-    else:
-        print(f"      ⚠️  物体未明显上升（Δz={delta_z:.1f}cm），松开重试")
-        control_gripper(robot_id, open_width=0.04, steps=100)
-        return False
+    return {
+        "ok": bool(ok), "reason": reason,
+        "dz_cm": round(delta_z, 2), "dz_hold_cm": round(delta_z_hold, 2),
+        "grip_mm": round(grip_mm, 1), "support_contacts": int(support),
+    }
 
 
 def main():
@@ -570,16 +626,21 @@ def main():
 
         # 执行抓取
         try:
-            success = grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params)
+            res = grasp_object(robot_id, obj_id, obj_name, pos_world, grasp_params)
+            if isinstance(res, dict):
+                success, reason = res["ok"], res["reason"]
+            else:  # 兼容旧返回（bool）
+                success, reason = bool(res), "legacy-bool"
         except Exception as e:
             print(f"   ❌ [{obj_name}] 抓取异常: {e}")
-            success = False
+            success, reason = False, "exception"
             # 如果 PyBullet 断开，停止后续物体
             if "Not connected" in str(e):
                 print("   ⚠️  PyBullet 断开，终止抓取")
-                results.append({"name": obj_name, "success": False, "error": "simulation_disconnected"})
+                results.append({"name": obj_name, "success": False,
+                                "reason": "simulation_disconnected"})
                 break
-        results.append({"name": obj_name, "success": success})
+        results.append({"name": obj_name, "success": success, "reason": reason})
 
         # 如果 PyBullet 断开，停止
         try:

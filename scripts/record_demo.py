@@ -116,6 +116,13 @@ def main():
             state["label"] = f"[{last_obj['name']}] IK approach + fine descent"
         elif "手指接触" in text:
             state["label"] = f"[{last_obj['name']}] gripper closing (contact detected)"
+        elif "判据:" in text and "✅ 成功" in text:
+            state["ok"] += 1
+            state["label"] = f"[{last_obj['name']}] verified - SUCCESS"
+        elif "判据:" in text and "❌ 失败" in text:
+            m2 = re.search(r"❌ 失败\[([^\]]+)\]", text)
+            state["label"] = (f"[{last_obj['name']}] FAILED - "
+                              f"{m2.group(1) if m2 else 'unknown'}")
         elif "抓取成功" in text:
             state["ok"] += 1
             state["label"] = f"[{last_obj['name']}] lift verified - SUCCESS"

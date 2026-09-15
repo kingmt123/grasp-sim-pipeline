@@ -162,7 +162,9 @@ def phase_pose(trials, objects, jitter, rng, detector, rot=0.0):
 # ── Phase B: 抓取成功率 ──────────────────────────────────────────────
 def phase_grasp(trials, objects, jitter, rng, detector, rot=0.0):
     print("\n" + "=" * 64)
-    print(f"  🤖 Phase B: 多物体抓取成功率 ({trials} 轮, GUI, 成功判据 Δz>1cm)")
+    crit = ("legacy(Δz>1cm)" if os.environ.get("GRASP_LEGACY_CRITERION", "0") == "1"
+            else "严格(Δz>1cm 且 保持240步不滑落 且 夹持>5mm 且 脱离支撑面)")
+    print(f"  🤖 Phase B: 多物体抓取成功率 ({trials} 轮, GUI, 判据={crit})")
     print("=" * 64)
 
     rows = []
@@ -187,16 +189,21 @@ def phase_grasp(trials, objects, jitter, rng, detector, rot=0.0):
                 continue
 
             try:
-                ok = bool(MAIN.grasp_object(robot_id, info["obj_id"], name, est, grasp_params))
+                res = MAIN.grasp_object(robot_id, info["obj_id"], name, est, grasp_params)
+                if isinstance(res, dict):
+                    ok, reason, detail = res["ok"], res["reason"], dict(res)
+                else:
+                    ok, reason, detail = bool(res), "legacy-bool", {}
             except Exception as exc:  # noqa: BLE001
                 print(f"   [{name}] ❌ 抓取异常: {exc}")
-                ok = False
+                ok, reason, detail = False, "exception", {}
                 if "Not connected" in str(exc):
                     rows.append({"trial": t, "object": name, "success": False,
                                  "error": "simulation_disconnected"})
                     print("   ⚠️  PyBullet 断开，终止本轮")
                     break
-            rows.append({"trial": t, "object": name, "success": ok})
+            rows.append({"trial": t, "object": name, "success": ok,
+                         "reason": reason, **detail})
         try:
             p.disconnect()
         except Exception:  # noqa: BLE001
@@ -251,6 +258,26 @@ def summarize(pose_rows, grasp_rows, objects):
             print(f"              {'总计':<8} {total_ok}/{total}  ({total_ok / total * 100:.0f}%)")
             summary["grasp"]["overall"] = {"success": total_ok, "n": total,
                                            "rate": round(total_ok / total, 3)}
+            # 失败归因（严格判据带来的新能力）
+            reasons = {}
+            for r in grasp_rows:
+                if not r["success"]:
+                    k = r.get("reason", "unknown")
+                    reasons[k] = reasons.get(k, 0) + 1
+            if reasons:
+                print(f"              {'失败归因':<8} "
+                      + "  ".join(f"{k}×{v}" for k, v in sorted(reasons.items())))
+                summary["grasp"]["failure_reasons"] = reasons
+            # 判据细节（判断是否"贴着判据线"）
+            for name in objects:
+                rs = [r for r in grasp_rows if r["object"] == name and "grip_mm" in r]
+                if not rs:
+                    continue
+                gm = statistics.mean(r["grip_mm"] for r in rs)
+                dz = statistics.mean(r["dz_hold_cm"] for r in rs)
+                print(f"              {name:<8} 夹持开度均值={gm:5.1f}mm  保持Δz均值={dz:+5.1f}cm")
+                summary["grasp"][name]["grip_mm_mean"] = round(gm, 1)
+                summary["grasp"][name]["dz_hold_cm_mean"] = round(dz, 2)
     return summary
 
 
